@@ -1,76 +1,78 @@
-import torch
 import numpy as np
 import pandas as pd
-
-from tqdm.notebook import tqdm
+import tensorflow as tf
 
 from transformers import BertTokenizer
-from torch.utils.data import TensorDataset
-from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import f1_score
-from transformers import BertForSequenceClassification
-from transformers import AdamW, get_linear_schedule_with_warmup
+from transformers import TFAutoModel
 
+def map_func(input_ids, masks,labels):
+    return { 'input_ids': input_ids, 'attention_mask' : masks}, labels
 
-df = pd.read_csv('data/title_conference.csv')
-print(df)
+df = pd.read_csv('data/train.tsv', sep='\t')
 
-df['Conference'].value_counts()
+seq_len=512
+num_samples = len(df)
 
-possible_labels = df.Conference.unique()
+Xids = np.zeros((num_samples,seq_len))
+Xmask = np.zeros((num_samples,seq_len))
 
+tokenizer = BertTokenizer.from_pretrained('bert-base-cased')
 
-label_dict = {}
-for index, possible_label in enumerate(possible_labels):
-    label_dict[possible_label] = index
-print(label_dict)
+for i, phrase in enumerate(df['Phrase']):
+    tokens = tokenizer.encode_plus(phrase,
+                                   max_length=seq_len,
+                                   truncation=True,
+                                   padding='max_length',
+                                   add_special_tokens=True,
+                                   return_tensors='tf')
+    Xids[i, :] = tokens['input_ids']
+    Xmask[i, :] = tokens['attention_mask']
 
-df['label'] = df.Conference.replace(label_dict)
+arr = df['Sentiment'].values
+print(arr)
 
-X_train, X_val, y_train, y_val = train_test_split(df.index.values,
-                                                  df.label.values,
-                                                  test_size=0.15,
-                                                  random_state=42,
-                                                  stratify=df.label.values)
+labels = np.zeros((num_samples,arr.max()+1))
+labels[np.arange(num_samples), arr] = 1
 
-df['data_type'] = ['not_set']*df.shape[0]
+dataset = tf.data.Dataset.from_tensor_slices((Xids,Xmask,labels))
+dataset = dataset.map(map_func)
 
-df.loc[X_train, 'data_type'] = 'train'
-df.loc[X_val, 'data_type'] = 'val'
+batch_size = 6
+dataset = dataset.shuffle(10000).batch(batch_size,
+                                       drop_remainder=True)
+split = 0.9
+size = int((num_samples / batch_size) * split)
 
-df.groupby(['Conference', 'label', 'data_type']).count()
+train_ds = dataset.take(size)
+val_ds = dataset.skip(size)
 
-tokenizer = BertTokenizer.from_pretrained('bert-base-uncased',
-                                          do_lower_case=True)
+del dataset
 
-encoded_data_train = tokenizer.batch_encode_plus(
-    df[df.data_type == 'train'].Title.values,
-    add_special_tokens=True,
-    return_attention_mask=True,
-    pad_to_max_length=True,
-    truncation=True,
-    max_length=256,
-    return_tensors='pt'
+bert = TFAutoModel.from_pretrained('bert-base-cased')
+
+input_ids = tf.keras.layers.Input(shape=(seq_len),
+                                 name='input_ids',
+                                 dtype='int32')
+mask = tf.keras.layers.Input(shape=(seq_len),
+                                 name='attention_mask',
+                                 dtype='int32')
+
+embeddings = bert.bert(input_ids,attention_mask=mask,)[1]
+
+x = tf.keras.layers.Dense(1024, activation='relu')(embeddings)
+y = tf.keras.layers.Dense(arr.max()+1, activation='softmax', name='outputs')(x)
+
+model = tf.keras.Model(inputs=[input_ids, mask], outputs=y)
+
+optimizer = tf.keras.optimizers.Adam(lr=1e-5, decay=1e-6)
+loss = tf.keras.losses.CategoricalCrossentropy()
+acc = tf.keras.metrics.CategoricalAccuracy('accuracy')
+model.compile(optimizer=optimizer, loss=loss, metrics=[acc])
+
+history = model.fit(
+    train_ds,
+    validation_data= val_ds,
+    epochs=3
 )
 
-encoded_data_val = tokenizer.batch_encode_plus(
-    df[df.data_type == 'val'].Title.values,
-    add_special_tokens=True,
-    return_attention_mask=True,
-    pad_to_max_length=True,
-    truncation=True,
-    max_length=256,
-    return_tensors='pt'
-)
-
-input_ids_train = encoded_data_train['input_ids']
-attention_masks_train = encoded_data_train['attention_mask']
-labels_train = torch.tensor(df[df.data_type == 'train'].label.values)
-
-input_ids_val = encoded_data_val['input_ids']
-attention_masks_val = encoded_data_val['attention_mask']
-labels_val = torch.tensor(df[df.data_type == 'val'].label.values)
-
-dataset_train = TensorDataset(input_ids_train, attention_masks_train, labels_train)
-dataset_val = TensorDataset(input_ids_val, attention_masks_val, labels_val)
+model.save('sentiment_model')
